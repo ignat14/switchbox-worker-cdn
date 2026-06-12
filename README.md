@@ -35,14 +35,19 @@ curl -i https://switchbox-worker-cdn.<account>.workers.dev/<sdk_key>/flags.json
 Expect 200, `Cache-Control: public, max-age=30`, `Access-Control-Allow-Origin: *`;
 an unknown key returns a 404 JSON body.
 
-## Cutover
+## Cutover (done 2026-06-12) / rollback
 
-Uncomment the `routes` block in `wrangler.toml` and redeploy — requests to
-`cdn.switchbox.dev/*` then hit the Worker instead of the R2 custom domain.
-Reversible by re-commenting and redeploying.
+The `routes` block in `wrangler.toml` puts this Worker in front of
+`cdn.switchbox.dev/*` (it takes precedence over the R2 custom domain, which
+stays attached to the bucket). **Rollback:** comment out the `routes` block and
+redeploy — the R2 custom domain takes back over.
 
-After cutover, append `sdk_first_fetch` as step 5 of the **Activation** funnel
-in PostHog (see `OBSERVABILITY.md` Phase 3).
+`sdk_first_fetch` is wired as step 5 of the **Activation** funnel in PostHog
+(see `OBSERVABILITY.md` Phase 3).
+
+Setup gotcha: a Worker with an AE binding won't deploy (error 10089) until
+Analytics Engine is enabled account-wide by creating the dataset in the
+Cloudflare dashboard (Workers → Analytics Engine → Create Dataset).
 
 ## Bindings & env
 

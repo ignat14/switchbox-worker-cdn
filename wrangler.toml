@@ -2,12 +2,11 @@ name = "switchbox-worker-cdn"
 main = "src/index.ts"
 compatibility_date = "2024-12-01"
 
-# Cutover: uncommenting this route moves cdn.switchbox.dev from the R2 custom
-# domain to this Worker. Instant, and reversible by re-commenting + deploying.
-# Test on the workers.dev URL first.
-# routes = [
-#   { pattern = "cdn.switchbox.dev/*", zone_name = "switchbox.dev" }
-# ]
+# This route takes cdn.switchbox.dev over from the R2 custom domain.
+# Rollback: comment it out and redeploy.
+routes = [
+  { pattern = "cdn.switchbox.dev/*", zone_name = "switchbox.dev" }
+]
 
 [vars]
 POSTHOG_HOST = "https://eu.i.posthog.com"
@@ -21,7 +20,7 @@ bucket_name = "switchbox-configs"
 [[kv_namespaces]]
 binding = "CONNECTIONS"
 # Create with: npx wrangler kv namespace create CONNECTIONS
-id = "REPLACE_WITH_KV_NAMESPACE_ID"
+id = "2afbbd888942493895222f6a082c60c4"
 
 [[analytics_engine_datasets]]
 binding = "SDK_ANALYTICS"
