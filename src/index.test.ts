@@ -1,27 +1,47 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import worker from "./index";
+import worker, { _resetForTests } from "./index";
 
 // ~43-char opaque sdk key, matching the production format.
 const KEY = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEF-_";
 
+// Isolate-local state (the conn-write memo) must not leak across tests.
+beforeEach(() => _resetForTests());
+
 interface MockOpts {
   /** R2 .get behavior: an object body, null (missing), or "throw". */
   r2?: { body: string; size?: number } | null | "throw";
+  /** Make the R2 object's .text() body read reject mid-stream. */
+  bodyThrows?: boolean;
   /** KV .get behavior: a stored value, null (first fetch), or "throw". */
   kvGet?: string | null | "throw";
+  /** Make the KV .put reject. */
+  kvPutThrows?: boolean;
   /** Make Analytics Engine writeDataPoint throw. */
   aeThrows?: boolean;
   posthogApiKey?: string;
 }
 
 function makeEnv(opts: MockOpts) {
-  const { r2 = { body: '{"version":"v1","flags":{}}' }, kvGet = "ts", aeThrows, posthogApiKey } = opts;
+  const {
+    r2 = { body: '{"version":"v1","flags":{}}' },
+    bodyThrows,
+    kvGet = "ts",
+    kvPutThrows,
+    aeThrows,
+    posthogApiKey,
+  } = opts;
   return {
     CONFIGS: {
       get: vi.fn(async () => {
         if (r2 === "throw") throw new Error("R2 down");
         if (r2 === null) return null;
-        return { text: async () => r2.body, size: r2.size ?? r2.body.length };
+        return {
+          text: async () => {
+            if (bodyThrows) throw new Error("body stream failed");
+            return r2.body;
+          },
+          size: r2.size ?? r2.body.length,
+        };
       }),
     },
     CONNECTIONS: {
@@ -29,7 +49,9 @@ function makeEnv(opts: MockOpts) {
         if (kvGet === "throw") throw new Error("KV down");
         return kvGet;
       }),
-      put: vi.fn(async () => {}),
+      put: vi.fn(async () => {
+        if (kvPutThrows) throw new Error("KV put failed");
+      }),
     },
     SDK_ANALYTICS: {
       writeDataPoint: vi.fn(() => {
@@ -102,6 +124,17 @@ describe("CDN worker — fail-open contract (R2 is the only hard dependency)", (
     expect((await res.json()).error).toBe("config_unavailable");
   });
 
+  it("a failed R2 BODY read is a controlled 500 with CORS + telemetry, not a 1101 (FABLE 4.1)", async () => {
+    const env = makeEnv({ bodyThrows: true });
+    const { ctx } = makeCtx();
+    const res = await call(env, ctx);
+    expect(res.status).toBe(500);
+    expect((await res.json()).error).toBe("config_unavailable");
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    // The telemetry row still records the failure.
+    expect(env.SDK_ANALYTICS.writeDataPoint).toHaveBeenCalledOnce();
+  });
+
   it("still 200 when KV (liveness) throws", async () => {
     const { ctx, settle } = makeCtx();
     const res = await call(makeEnv({ kvGet: "throw" }), ctx);
@@ -141,5 +174,57 @@ describe("CDN worker — telemetry wiring", () => {
     await settle();
     expect(env.SDK_ANALYTICS.writeDataPoint).toHaveBeenCalledOnce();
     expect(env.CONNECTIONS.get).toHaveBeenCalledWith(`conn:${KEY}`);
+  });
+
+  it("polls inside the throttle window do ZERO KV ops — the read is memoized in-isolate (FABLE 4.3)", async () => {
+    // A fresh timestamp in KV → the first poll reads it, memoizes, no write.
+    const env = makeEnv({ kvGet: new Date().toISOString() });
+    const first = makeCtx();
+    await call(env, first.ctx);
+    await first.settle();
+    expect(env.CONNECTIONS.get).toHaveBeenCalledTimes(1);
+    expect(env.CONNECTIONS.put).not.toHaveBeenCalled();
+
+    // Subsequent polls for the same key skip the KV read entirely.
+    const second = makeCtx();
+    await call(env, second.ctx);
+    await second.settle();
+    expect(env.CONNECTIONS.get).toHaveBeenCalledTimes(1);
+    expect(env.CONNECTIONS.put).not.toHaveBeenCalled();
+  });
+
+  it("first fetch: KV put lands BEFORE the PostHog capture, so a failed put can't re-fire the event (FABLE 4.4)", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(null, { status: 200 }));
+    try {
+      // put rejects → the capture must never have been attempted (put-first
+      // ordering: the key's absence is the dedup).
+      const env = makeEnv({ kvGet: null, kvPutThrows: true, posthogApiKey: "phc_test" });
+      const { ctx, settle } = makeCtx();
+      const res = await call(env, ctx);
+      await settle();
+      expect(res.status).toBe(200); // fail-open holds
+      expect(env.CONNECTIONS.put).toHaveBeenCalledOnce();
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
+
+    _resetForTests();
+    const fetchSpy2 = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(null, { status: 200 }));
+    try {
+      // Happy path: put succeeds → capture fires exactly once.
+      const env = makeEnv({ kvGet: null, posthogApiKey: "phc_test" });
+      const { ctx, settle } = makeCtx();
+      await call(env, ctx);
+      await settle();
+      expect(env.CONNECTIONS.put).toHaveBeenCalledOnce();
+      expect(fetchSpy2).toHaveBeenCalledOnce();
+    } finally {
+      fetchSpy2.mockRestore();
+    }
   });
 });
