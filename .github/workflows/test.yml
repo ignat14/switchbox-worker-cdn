@@ -1,0 +1,24 @@
+# Test-on-push CI (FABLE_IMPROVEMENTS 3.4). This worker is the read path for
+# every SDK client, and until now `npm test` before deploy was convention only.
+# Deploys stay manual (wrangler deploy) per the cloudflare-worker skill — this
+# workflow only guards; it never ships.
+name: Test
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
