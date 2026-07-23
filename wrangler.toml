@@ -12,6 +12,10 @@ routes = [
 POSTHOG_HOST = "https://eu.i.posthog.com"
 # POSTHOG_API_KEY is set via `wrangler secret put POSTHOG_API_KEY`
 # (same public project key as the frontend's VITE_POSTHOG_KEY)
+# Backend origin for the first-telemetry activation ping (MEASUREMENT Phase 1).
+BACKEND_URL = "https://switchbox-backend.fly.dev"
+# TELEMETRY_SEEN_SECRET is set via `wrangler secret put TELEMETRY_SEEN_SECRET`
+# (must match the backend's TELEMETRY_INGEST_SECRET Fly secret).
 
 [[r2_buckets]]
 binding = "CONFIGS"
@@ -25,3 +29,10 @@ id = "2afbbd888942493895222f6a082c60c4"
 [[analytics_engine_datasets]]
 binding = "SDK_ANALYTICS"
 dataset = "switchbox_sdk_requests"
+
+# Anonymous per-flag evaluation counts (MEASUREMENT Phase 1 / ADR-054) — fed by
+# POST /{sdk_key}/telemetry. Row: index=sdk_key; blobs=flag_key,value_repr,
+# sdk_name,sdk_version; double=count. Read by the dashboard via the AE SQL API.
+[[analytics_engine_datasets]]
+binding = "FLAG_ANALYTICS"
+dataset = "switchbox_flag_evals"

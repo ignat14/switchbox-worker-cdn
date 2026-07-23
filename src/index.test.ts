@@ -43,6 +43,12 @@ function makeEnv(opts: MockOpts) {
           size: r2.size ?? r2.body.length,
         };
       }),
+      // Telemetry ingest gates on key existence via .head (MEASUREMENT Phase 1).
+      head: vi.fn(async () => {
+        if (r2 === "throw") throw new Error("R2 down");
+        if (r2 === null) return null;
+        return { size: r2.size ?? r2.body.length };
+      }),
     },
     CONNECTIONS: {
       get: vi.fn(async () => {
@@ -58,9 +64,27 @@ function makeEnv(opts: MockOpts) {
         if (aeThrows) throw new Error("AE down");
       }),
     },
+    FLAG_ANALYTICS: {
+      writeDataPoint: vi.fn(() => {
+        if (aeThrows) throw new Error("AE down");
+      }),
+    },
     POSTHOG_HOST: "https://posthog.test",
     POSTHOG_API_KEY: posthogApiKey,
   };
+}
+
+function postTelemetry(env: any, ctx: any, key = KEY, body?: unknown, init: RequestInit = {}) {
+  return worker.fetch(
+    new Request(`https://cdn.switchbox.dev/${key}/telemetry`, {
+      method: "POST",
+      body: body === undefined ? undefined : JSON.stringify(body),
+      headers: { "Content-Type": "application/json" },
+      ...init,
+    }),
+    env,
+    ctx,
+  );
 }
 
 function makeCtx() {
@@ -84,7 +108,7 @@ describe("CDN worker — routing", () => {
     expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
   });
 
-  it("405 on non-GET methods", async () => {
+  it("405 on non-GET methods to the read path", async () => {
     const { ctx } = makeCtx();
     const res = await call(makeEnv({}), ctx, `/${KEY}/flags.json`, "POST");
     expect(res.status).toBe(405);
@@ -110,7 +134,7 @@ describe("CDN worker — serving", () => {
     const res = await call(makeEnv({ r2: { body: '{"version":"v9","flags":{}}' } }), ctx);
     expect(res.status).toBe(200);
     expect(await res.text()).toBe('{"version":"v9","flags":{}}');
-    expect(res.headers.get("Cache-Control")).toBe("public, max-age=30");
+    expect(res.headers.get("Cache-Control")).toBe("public, max-age=10");
     expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
     expect(res.headers.get("Content-Type")).toBe("application/json");
   });
@@ -226,5 +250,151 @@ describe("CDN worker — telemetry wiring", () => {
     } finally {
       fetchSpy2.mockRestore();
     }
+  });
+});
+
+describe("CDN worker — telemetry ingest (MEASUREMENT Phase 1)", () => {
+  const summary = {
+    sdk_name: "switchbox-python",
+    sdk_version: "0.6.0",
+    flags: { checkout_flow: { true: 3900, false: 301 }, hero: { '"A"': 12 } },
+  };
+
+  it("writes one FLAG_ANALYTICS row per (flag, value) and 204s", async () => {
+    const env = makeEnv({});
+    const { ctx } = makeCtx();
+    const res = await postTelemetry(env, ctx, KEY, summary);
+    expect(res.status).toBe(204);
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    expect(env.FLAG_ANALYTICS.writeDataPoint).toHaveBeenCalledTimes(3);
+    expect(env.FLAG_ANALYTICS.writeDataPoint).toHaveBeenCalledWith({
+      indexes: [KEY],
+      blobs: ["checkout_flow", "true", "switchbox-python", "0.6.0"],
+      doubles: [3900],
+    });
+    // The read-path dataset is untouched by telemetry ingest.
+    expect(env.SDK_ANALYTICS.writeDataPoint).not.toHaveBeenCalled();
+  });
+
+  it("404s an unknown key WITHOUT writing AE rows, parsing, or pinging (forged-key bound)", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null));
+    try {
+      const env = {
+        ...makeEnv({ r2: null }), // no published config for this key
+        BACKEND_URL: "https://backend.test",
+        TELEMETRY_SEEN_SECRET: "s3cret",
+      };
+      const { ctx, settle } = makeCtx();
+      const res = await postTelemetry(env, ctx, "forged-key-abcdefghij", summary);
+      await settle();
+      expect(res.status).toBe(404);
+      expect(env.FLAG_ANALYTICS.writeDataPoint).not.toHaveBeenCalled();
+      expect(fetchSpy).not.toHaveBeenCalled(); // no backend ping for a fake key
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it("400 on invalid JSON / missing flags", async () => {
+    const { ctx } = makeCtx();
+    const bad = await worker.fetch(
+      new Request(`https://cdn.switchbox.dev/${KEY}/telemetry`, {
+        method: "POST",
+        body: "not json",
+      }),
+      makeEnv({}),
+      ctx,
+    );
+    expect(bad.status).toBe(400);
+    const noFlags = await postTelemetry(makeEnv({}), makeCtx().ctx, KEY, { sdk_name: "x" });
+    expect(noFlags.status).toBe(400);
+  });
+
+  it("405 on GET to the telemetry route", async () => {
+    const { ctx } = makeCtx();
+    const res = await call(makeEnv({}), ctx, `/${KEY}/telemetry`, "GET");
+    expect(res.status).toBe(405);
+  });
+
+  it("ignores non-positive / non-finite counts and malformed value maps", async () => {
+    const env = makeEnv({});
+    const { ctx } = makeCtx();
+    await postTelemetry(env, ctx, KEY, {
+      flags: { f: { good: 5, zero: 0, neg: -3, nan: "x" }, bad: "not-an-object" },
+    });
+    expect(env.FLAG_ANALYTICS.writeDataPoint).toHaveBeenCalledTimes(1);
+    expect(env.FLAG_ANALYTICS.writeDataPoint).toHaveBeenCalledWith({
+      indexes: [KEY],
+      blobs: ["f", "good", "", ""],
+      doubles: [5],
+    });
+  });
+
+  it("is fail-open: a throwing FLAG_ANALYTICS write still 204s", async () => {
+    const env = makeEnv({ aeThrows: true });
+    const { ctx } = makeCtx();
+    const res = await postTelemetry(env, ctx, KEY, summary);
+    expect(res.status).toBe(204);
+  });
+
+  it("caps values per flag (extras dropped)", async () => {
+    const values: Record<string, number> = {};
+    for (let i = 0; i < 40; i++) values[`v${i}`] = 1;
+    const env = makeEnv({});
+    const { ctx } = makeCtx();
+    await postTelemetry(env, ctx, KEY, { flags: { f: values } });
+    // TELEMETRY_MAX_VALUES_PER_FLAG = 20
+    expect(env.FLAG_ANALYTICS.writeDataPoint).toHaveBeenCalledTimes(20);
+  });
+
+  it("fires a first-seen ping to the backend once per isolate (memoized)", async () => {
+    const fetchSpy = vi
+      .spyOn(globalThis, "fetch")
+      .mockResolvedValue(new Response(null, { status: 204 }));
+    try {
+      const env = {
+        ...makeEnv({}),
+        BACKEND_URL: "https://backend.test",
+        TELEMETRY_SEEN_SECRET: "s3cret",
+      };
+      const first = makeCtx();
+      await postTelemetry(env, first.ctx, KEY, { flags: { f: { true: 1 } } });
+      await first.settle();
+      expect(fetchSpy).toHaveBeenCalledOnce();
+      const [url, init] = fetchSpy.mock.calls[0];
+      expect(url).toBe("https://backend.test/internal/telemetry-seen");
+      expect((init!.headers as Record<string, string>)["X-Telemetry-Secret"]).toBe("s3cret");
+      expect(JSON.parse(init!.body as string)).toEqual({ sdk_key: KEY });
+
+      // Second POST for the same key in the same isolate → no second ping.
+      const second = makeCtx();
+      await postTelemetry(env, second.ctx, KEY, { flags: { f: { true: 1 } } });
+      await second.settle();
+      expect(fetchSpy).toHaveBeenCalledOnce();
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it("skips the first-seen ping when the backend ping isn't configured", async () => {
+    const fetchSpy = vi.spyOn(globalThis, "fetch").mockResolvedValue(new Response(null));
+    try {
+      const { ctx, settle } = makeCtx();
+      await postTelemetry(makeEnv({}), ctx, KEY, { flags: { f: { true: 1 } } });
+      await settle();
+      expect(fetchSpy).not.toHaveBeenCalled();
+    } finally {
+      fetchSpy.mockRestore();
+    }
+  });
+
+  it("rate-limits a runaway sender (429) after the per-window ceiling", async () => {
+    const env = makeEnv({});
+    // TELEMETRY_RATE_MAX = 600 per key per window; 601st is rejected.
+    let last: Response | undefined;
+    for (let i = 0; i < 601; i++) {
+      last = await postTelemetry(env, makeCtx().ctx, KEY, { flags: { f: { true: 1 } } });
+    }
+    expect(last!.status).toBe(429);
   });
 });

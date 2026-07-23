@@ -2,13 +2,53 @@ interface Env {
   CONFIGS: R2Bucket;
   CONNECTIONS: KVNamespace;
   SDK_ANALYTICS?: AnalyticsEngineDataset;
+  // Anonymous per-flag evaluation counts (MEASUREMENT Phase 1 / ADR-055).
+  FLAG_ANALYTICS?: AnalyticsEngineDataset;
   POSTHOG_HOST: string;
   POSTHOG_API_KEY?: string;
+  // First-telemetry activation ping → the backend (MEASUREMENT Phase 1). Both
+  // unset (local/CI) → the ping is skipped; the shared secret gates the endpoint.
+  BACKEND_URL?: string;
+  TELEMETRY_SEEN_SECRET?: string;
 }
 
 // sdk_key is secrets.token_urlsafe(32) → ~43 chars of [A-Za-z0-9_-].
 // Wide bounds so key-format changes don't 404 the read path.
 const PATH_RE = /^\/([A-Za-z0-9_-]{16,128})\/flags\.json$/;
+// Telemetry ingest route: POST /{sdk_key}/telemetry (MEASUREMENT Phase 1).
+const TELEMETRY_RE = /^\/([A-Za-z0-9_-]{16,128})\/telemetry$/;
+
+// --- Telemetry ingest guards (all fail-open; telemetry is best-effort) ---
+// Per-request AE-write ceilings bound the cost of any single POST regardless of
+// what a client (or an abuser) sends; the SDK caps values per flag at ~11, so
+// real payloads never approach these. Extras are silently dropped.
+const TELEMETRY_MAX_DATAPOINTS = 200;
+const TELEMETRY_MAX_VALUES_PER_FLAG = 20;
+const TELEMETRY_MAX_BODY_BYTES = 64 * 1024;
+// Basic in-isolate anti-abuse rate limit, per sdk_key per fixed 60s window.
+// Generous (a legit fleet sharing one key in one colo stays well under it); a
+// runaway sender is capped. Per-isolate/best-effort, like the conn-write memo —
+// an over-limit key just gets its telemetry sampled, which is acceptable.
+const TELEMETRY_RATE_WINDOW_MS = 60 * 1000;
+const TELEMETRY_RATE_MAX = 600;
+const telemetryRate = new Map<string, { windowStart: number; count: number }>();
+const TELEMETRY_RATE_MAP_MAX = 10_000;
+
+// In-isolate memo of sdk_keys we've already sent a first-telemetry ping for, so
+// the backend gets ~one ping per isolate ever (not per flush). The backend's
+// UPDATE ... WHERE first_seen_at IS NULL is the exact fire-once dedup, so the
+// worst case of a few pings across isolates/colos is idempotent there.
+const firstSeenMemo = new Set<string>();
+const FIRST_SEEN_MEMO_MAX = 10_000;
+
+// In-isolate memo of sdk_keys confirmed to have a config in R2. The telemetry
+// ingest gates on this (mirroring the read path's "unknown key → 404") so a
+// forged/rotated key can't drive AE writes *or* backend activation pings — the
+// rate limiter alone can't stop that, since an attacker varies the very key it's
+// keyed on. Only HITS are memoized; misses re-check R2 (cheap, and never touch
+// Neon), so the amplification is bounded to R2 class-B ops, not DB writes.
+const configExistsMemo = new Set<string>();
+const CONFIG_EXISTS_MEMO_MAX = 10_000;
 
 // KV free tier is 1,000 writes/day; a 5-min throttle keeps an always-on
 // instance at ~288 writes/day. The Phase 4 badge threshold accounts for this.
@@ -30,13 +70,16 @@ const CONN_MEMO_MAX = 10_000;
 /** Test-only: clear isolate-local state between test cases. */
 export function _resetForTests(): void {
   connWriteMemo.clear();
+  telemetryRate.clear();
+  firstSeenMemo.clear();
+  configExistsMemo.clear();
 }
 
 // The browser SDK fetches cross-origin; the R2 custom domain allowed this
 // before the cutover, so the Worker must keep doing it.
 const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, OPTIONS",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "*",
   "Access-Control-Max-Age": "86400",
 };
@@ -53,11 +96,24 @@ export default {
     if (request.method === "OPTIONS") {
       return new Response(null, { status: 204, headers: CORS_HEADERS });
     }
+
+    const url = new URL(request.url);
+
+    // Telemetry ingest (MEASUREMENT Phase 1 / ADR-055): anonymous per-flag
+    // evaluation counts → the switchbox_flag_evals AE dataset. Separate from
+    // the flags.json read path; wholly fail-open.
+    const telemetryMatch = TELEMETRY_RE.exec(url.pathname);
+    if (telemetryMatch) {
+      if (request.method !== "POST") {
+        return jsonResponse(405, { error: "method_not_allowed" });
+      }
+      return handleTelemetry(env, request, ctx, telemetryMatch[1]);
+    }
+
     if (request.method !== "GET") {
       return jsonResponse(405, { error: "method_not_allowed" });
     }
 
-    const url = new URL(request.url);
     const match = PATH_RE.exec(url.pathname);
     if (!match) {
       return jsonResponse(404, { error: "not_found" });
@@ -103,14 +159,154 @@ export default {
       status: 200,
       headers: {
         "Content-Type": "application/json",
-        // Browser-side caching only — no edge cache in front of the Worker,
-        // so every poll is observed.
-        "Cache-Control": "public, max-age=30",
+        // Browser-side caching only — no edge cache in front of the Worker, so
+        // every poll is observed. Matched to the 10s SDK poll (MEASUREMENT
+        // Phase 0): a longer max-age would let the browser HTTP cache serve a
+        // stale config (and skip the Worker → poll unobserved) for up to that
+        // window, defeating the faster propagation and the read-path telemetry.
+        "Cache-Control": "public, max-age=10",
         ...CORS_HEADERS,
       },
     });
   },
 };
+
+function truncate(value: string, max: number): string {
+  return value.length > max ? value.slice(0, max) : value;
+}
+
+// Does this sdk_key have a published config? Memoizes hits in-isolate; misses
+// re-check R2 (a cheap class-B `.head`, never Neon). Fail-closed on an R2 error
+// (drop the telemetry) — best-effort, and it keeps the forged-key bound intact
+// even during an R2 blip.
+async function configKeyExists(env: Env, sdkKey: string): Promise<boolean> {
+  if (configExistsMemo.has(sdkKey)) return true;
+  try {
+    const head = await env.CONFIGS.head(`${sdkKey}/flags.json`);
+    if (!head) return false;
+    if (configExistsMemo.size > CONFIG_EXISTS_MEMO_MAX) configExistsMemo.clear();
+    configExistsMemo.add(sdkKey);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// Fixed-window, in-isolate, per-key rate limit. Best-effort anti-abuse; an
+// over-limit key's telemetry is dropped (fail-open — telemetry is not the read
+// path). Returns true when the request should be rejected.
+function isTelemetryRateLimited(sdkKey: string): boolean {
+  const now = Date.now();
+  const entry = telemetryRate.get(sdkKey);
+  if (!entry || now - entry.windowStart >= TELEMETRY_RATE_WINDOW_MS) {
+    if (telemetryRate.size > TELEMETRY_RATE_MAP_MAX) telemetryRate.clear();
+    telemetryRate.set(sdkKey, { windowStart: now, count: 1 });
+    return false;
+  }
+  entry.count += 1;
+  return entry.count > TELEMETRY_RATE_MAX;
+}
+
+// Ingest one anonymous telemetry summary → one AE data point per (flag, value).
+// The env key (in the path) is the only identifier: no identity, no context.
+// Every failure mode returns a controlled JSON response with CORS; a bad AE
+// write is swallowed. Row shape (dataset switchbox_flag_evals):
+//   index1  = sdk_key
+//   blob1   = flag_key   blob2 = value_repr   blob3 = sdk_name   blob4 = sdk_version
+//   double1 = count (evaluations of that (flag,value) in the client's ~60s window)
+async function handleTelemetry(
+  env: Env,
+  request: Request,
+  ctx: ExecutionContext,
+  sdkKey: string,
+): Promise<Response> {
+  if (isTelemetryRateLimited(sdkKey)) {
+    return jsonResponse(429, { error: "rate_limited" });
+  }
+
+  // Reject telemetry for keys with no published config (mirrors the read path's
+  // unknown-key 404), BEFORE parsing the body or writing anything. This is the
+  // real bound on forged/rotated keys — the per-key rate limit above can't stop
+  // an attacker who varies the key. Fail-closed: if R2 can't confirm the key we
+  // drop the telemetry (best-effort anyway) rather than risk the amplification.
+  if (!(await configKeyExists(env, sdkKey))) {
+    return jsonResponse(404, { error: "unknown_sdk_key" });
+  }
+
+  const contentLength = Number(request.headers.get("content-length") ?? "0");
+  if (Number.isFinite(contentLength) && contentLength > TELEMETRY_MAX_BODY_BYTES) {
+    return jsonResponse(413, { error: "payload_too_large" });
+  }
+
+  let payload: unknown;
+  try {
+    payload = await request.json();
+  } catch {
+    return jsonResponse(400, { error: "invalid_json" });
+  }
+
+  const body = payload as Record<string, unknown> | null;
+  const flags = body?.flags;
+  if (!flags || typeof flags !== "object" || Array.isArray(flags)) {
+    return jsonResponse(400, { error: "invalid_payload" });
+  }
+
+  const sdkName = truncate(String(body?.sdk_name ?? ""), 64);
+  const sdkVersion = truncate(String(body?.sdk_version ?? ""), 32);
+
+  let written = 0;
+  for (const [flagKey, values] of Object.entries(flags as Record<string, unknown>)) {
+    if (written >= TELEMETRY_MAX_DATAPOINTS) break;
+    if (!values || typeof values !== "object" || Array.isArray(values)) continue;
+    const fk = truncate(String(flagKey), 128);
+    let perFlag = 0;
+    for (const [valueRepr, count] of Object.entries(values as Record<string, unknown>)) {
+      if (written >= TELEMETRY_MAX_DATAPOINTS || perFlag >= TELEMETRY_MAX_VALUES_PER_FLAG) break;
+      const n = Number(count);
+      if (!Number.isFinite(n) || n <= 0) continue;
+      try {
+        env.FLAG_ANALYTICS?.writeDataPoint({
+          indexes: [sdkKey],
+          blobs: [fk, truncate(String(valueRepr), 256), sdkName, sdkVersion],
+          doubles: [n],
+        });
+      } catch {
+        // Telemetry must never surface — drop this point.
+      }
+      written += 1;
+      perFlag += 1;
+    }
+  }
+
+  // First-telemetry activation: fire-and-forget a one-time ping to the backend
+  // (re-homes sdk_first_fetch off KV absence — MEASUREMENT Phase 1). Memoized
+  // per isolate so it's ~one ping ever, and the backend dedups exactly on the
+  // first_seen_at NULL→now() transition, so an occasional extra ping is a no-op.
+  pingFirstSeen(env, ctx, sdkKey);
+
+  return new Response(null, { status: 204, headers: CORS_HEADERS });
+}
+
+function pingFirstSeen(env: Env, ctx: ExecutionContext, sdkKey: string): void {
+  if (!env.BACKEND_URL || !env.TELEMETRY_SEEN_SECRET) return;
+  if (firstSeenMemo.has(sdkKey)) return;
+  if (firstSeenMemo.size > FIRST_SEEN_MEMO_MAX) firstSeenMemo.clear();
+  // Memoize before the call: at-most-once per isolate even if the ping fails
+  // (the backend is idempotent, and other isolates still ping). Fail-open.
+  firstSeenMemo.add(sdkKey);
+  ctx.waitUntil(
+    fetch(`${env.BACKEND_URL}/internal/telemetry-seen`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Telemetry-Secret": env.TELEMETRY_SEEN_SECRET,
+      },
+      body: JSON.stringify({ sdk_key: sdkKey }),
+    }).catch(() => {
+      // Activation is best-effort analytics — never surface.
+    }),
+  );
+}
 
 // Analytics Engine row per request. writeDataPoint is non-blocking.
 function recordRequest(
