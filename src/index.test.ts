@@ -4,7 +4,8 @@ import worker, { _resetForTests } from "./index";
 // ~43-char opaque sdk key, matching the production format.
 const KEY = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEF-_";
 
-// Isolate-local state (the conn-write memo) must not leak across tests.
+// Isolate-local state (rate limiter, first-seen + config-exists memos) must
+// not leak across tests.
 beforeEach(() => _resetForTests());
 
 interface MockOpts {
@@ -12,24 +13,12 @@ interface MockOpts {
   r2?: { body: string; size?: number } | null | "throw";
   /** Make the R2 object's .text() body read reject mid-stream. */
   bodyThrows?: boolean;
-  /** KV .get behavior: a stored value, null (first fetch), or "throw". */
-  kvGet?: string | null | "throw";
-  /** Make the KV .put reject. */
-  kvPutThrows?: boolean;
   /** Make Analytics Engine writeDataPoint throw. */
   aeThrows?: boolean;
-  posthogApiKey?: string;
 }
 
 function makeEnv(opts: MockOpts) {
-  const {
-    r2 = { body: '{"version":"v1","flags":{}}' },
-    bodyThrows,
-    kvGet = "ts",
-    kvPutThrows,
-    aeThrows,
-    posthogApiKey,
-  } = opts;
+  const { r2 = { body: '{"version":"v1","flags":{}}' }, bodyThrows, aeThrows } = opts;
   return {
     CONFIGS: {
       get: vi.fn(async () => {
@@ -50,15 +39,6 @@ function makeEnv(opts: MockOpts) {
         return { size: r2.size ?? r2.body.length };
       }),
     },
-    CONNECTIONS: {
-      get: vi.fn(async () => {
-        if (kvGet === "throw") throw new Error("KV down");
-        return kvGet;
-      }),
-      put: vi.fn(async () => {
-        if (kvPutThrows) throw new Error("KV put failed");
-      }),
-    },
     SDK_ANALYTICS: {
       writeDataPoint: vi.fn(() => {
         if (aeThrows) throw new Error("AE down");
@@ -69,8 +49,6 @@ function makeEnv(opts: MockOpts) {
         if (aeThrows) throw new Error("AE down");
       }),
     },
-    POSTHOG_HOST: "https://posthog.test",
-    POSTHOG_API_KEY: posthogApiKey,
   };
 }
 
@@ -129,7 +107,7 @@ describe("CDN worker — routing", () => {
 });
 
 describe("CDN worker — serving", () => {
-  it("200 with the config body, CORS, and a 30s browser cache", async () => {
+  it("200 with the config body, CORS, and a 10s browser cache", async () => {
     const { ctx } = makeCtx();
     const res = await call(makeEnv({ r2: { body: '{"version":"v9","flags":{}}' } }), ctx);
     expect(res.status).toBe(200);
@@ -159,97 +137,22 @@ describe("CDN worker — fail-open contract (R2 is the only hard dependency)", (
     expect(env.SDK_ANALYTICS.writeDataPoint).toHaveBeenCalledOnce();
   });
 
-  it("still 200 when KV (liveness) throws", async () => {
-    const { ctx, settle } = makeCtx();
-    const res = await call(makeEnv({ kvGet: "throw" }), ctx);
-    expect(res.status).toBe(200);
-    // The waitUntil work must not reject the read path.
-    await expect(settle()).resolves.toBeDefined();
-  });
-
   it("still 200 when Analytics Engine throws", async () => {
     const { ctx } = makeCtx();
     const res = await call(makeEnv({ aeThrows: true }), ctx);
     expect(res.status).toBe(200);
-  });
-
-  it("still 200 when the PostHog first-fetch capture throws", async () => {
-    // First fetch (KV miss) + a configured PostHog key → captureFirstFetch runs
-    // and calls global fetch; make that throw.
-    const fetchSpy = vi.spyOn(globalThis, "fetch").mockRejectedValue(new Error("posthog down"));
-    try {
-      const { ctx, settle } = makeCtx();
-      const res = await call(makeEnv({ kvGet: null, posthogApiKey: "phc_test" }), ctx);
-      expect(res.status).toBe(200);
-      await expect(settle()).resolves.toBeDefined();
-    } finally {
-      fetchSpy.mockRestore();
-    }
   });
 });
 
 describe("CDN worker — telemetry wiring", () => {
   beforeEach(() => vi.clearAllMocks());
 
-  it("records the request and tracks liveness on a 200", async () => {
+  it("records the request on a 200", async () => {
     const env = makeEnv({});
     const { ctx, settle } = makeCtx();
     await call(env, ctx);
     await settle();
     expect(env.SDK_ANALYTICS.writeDataPoint).toHaveBeenCalledOnce();
-    expect(env.CONNECTIONS.get).toHaveBeenCalledWith(`conn:${KEY}`);
-  });
-
-  it("polls inside the throttle window do ZERO KV ops — the read is memoized in-isolate (FABLE 4.3)", async () => {
-    // A fresh timestamp in KV → the first poll reads it, memoizes, no write.
-    const env = makeEnv({ kvGet: new Date().toISOString() });
-    const first = makeCtx();
-    await call(env, first.ctx);
-    await first.settle();
-    expect(env.CONNECTIONS.get).toHaveBeenCalledTimes(1);
-    expect(env.CONNECTIONS.put).not.toHaveBeenCalled();
-
-    // Subsequent polls for the same key skip the KV read entirely.
-    const second = makeCtx();
-    await call(env, second.ctx);
-    await second.settle();
-    expect(env.CONNECTIONS.get).toHaveBeenCalledTimes(1);
-    expect(env.CONNECTIONS.put).not.toHaveBeenCalled();
-  });
-
-  it("first fetch: KV put lands BEFORE the PostHog capture, so a failed put can't re-fire the event (FABLE 4.4)", async () => {
-    const fetchSpy = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValue(new Response(null, { status: 200 }));
-    try {
-      // put rejects → the capture must never have been attempted (put-first
-      // ordering: the key's absence is the dedup).
-      const env = makeEnv({ kvGet: null, kvPutThrows: true, posthogApiKey: "phc_test" });
-      const { ctx, settle } = makeCtx();
-      const res = await call(env, ctx);
-      await settle();
-      expect(res.status).toBe(200); // fail-open holds
-      expect(env.CONNECTIONS.put).toHaveBeenCalledOnce();
-      expect(fetchSpy).not.toHaveBeenCalled();
-    } finally {
-      fetchSpy.mockRestore();
-    }
-
-    _resetForTests();
-    const fetchSpy2 = vi
-      .spyOn(globalThis, "fetch")
-      .mockResolvedValue(new Response(null, { status: 200 }));
-    try {
-      // Happy path: put succeeds → capture fires exactly once.
-      const env = makeEnv({ kvGet: null, posthogApiKey: "phc_test" });
-      const { ctx, settle } = makeCtx();
-      await call(env, ctx);
-      await settle();
-      expect(env.CONNECTIONS.put).toHaveBeenCalledOnce();
-      expect(fetchSpy2).toHaveBeenCalledOnce();
-    } finally {
-      fetchSpy2.mockRestore();
-    }
   });
 });
 

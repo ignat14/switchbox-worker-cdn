@@ -7,12 +7,10 @@ touching the zero-dependency SDKs:
 
 1. **Analytics Engine** row per request (`switchbox_sdk_requests` dataset) —
    indexed by `sdk_key`; blobs: status, colo, country, user agent, config version.
-2. **KV liveness** — `conn:{sdk_key} = <ISO timestamp>`, throttled to one write
-   per 5 minutes per key (KV free tier: 1k writes/day). Powers the dashboard
-   "Connected" badge (Phase 4).
-3. **First-fetch activation** — if the KV key was absent, fires a server-side
-   `sdk_first_fetch` PostHog event with `distinct_id = sdk_key` (merged into the
-   owning user via the dashboard's `posthog.alias(sdkKey)` on key copy).
+   Since ADR-059 this dataset also backs the dashboard "Connected" badge (the
+   backend reads `MAX(timestamp)` per key via the AE SQL API); the former KV
+   liveness store and the KV-absence `sdk_first_fetch` capture are retired —
+   activation is fired by the backend on the first telemetry ping instead.
 
 It also accepts **`POST /{sdk_key}/telemetry`** (MEASUREMENT Phase 1 / ADR-054):
 an anonymous per-flag evaluation summary the SDKs flush every ~60s. Each
@@ -22,8 +20,11 @@ an anonymous per-flag evaluation summary the SDKs flush every ~60s. Each
 context. Per-request AE-write ceilings + a basic in-isolate per-key rate limit
 bound cost; everything is fail-open (a bad write is dropped, the route still
 204s). This is the value payoff of measurement (per-flag counts, value
-distribution, per-flag liveness, stale-flag + outdated-SDK views) and the path
-by which KV liveness will eventually be retired (prove-first — not yet removed).
+distribution, per-flag liveness, stale-flag + outdated-SDK views). On a key's
+first-ever telemetry the worker fire-and-forgets `POST /internal/telemetry-seen`
+to the backend (shared secret), which sets `environments.first_seen_at` once and
+fires the `sdk_first_fetch` activation event — the sole activation source since
+the KV retirement (ADR-059).
 
 **Fail open:** the R2 read is the only hard dependency. All telemetry runs in
 `ctx.waitUntil()` / try-catch (or, for ingest, its own swallowed try-catch) — if
@@ -33,8 +34,7 @@ every signal write fails, flags are still served.
 
 ```bash
 npm install
-npx wrangler kv namespace create CONNECTIONS   # paste the id into wrangler.toml
-npx wrangler secret put POSTHOG_API_KEY        # same key as VITE_POSTHOG_KEY
+npx wrangler secret put TELEMETRY_SEEN_SECRET  # must match the backend's TELEMETRY_INGEST_SECRET
 npx wrangler deploy                            # serves on workers.dev for testing
 ```
 
@@ -56,7 +56,8 @@ stays attached to the bucket). **Rollback:** comment out the `routes` block and
 redeploy — the R2 custom domain takes back over.
 
 `sdk_first_fetch` is wired as step 5 of the **Activation** funnel in PostHog
-(see `OBSERVABILITY.md` Phase 3).
+(see `OBSERVABILITY.md` Phase 3); since ADR-059 the backend fires it (first
+telemetry per environment), not this worker.
 
 Setup gotcha: a Worker with an AE binding won't deploy (error 10089) until
 Analytics Engine is enabled account-wide by creating the dataset in the
@@ -69,8 +70,7 @@ alongside `switchbox_sdk_requests` before deploying the ingest route.
 | Name | Kind | Notes |
 |---|---|---|
 | `CONFIGS` | R2 bucket | `switchbox-configs` |
-| `CONNECTIONS` | KV namespace | liveness keys `conn:{sdk_key}` |
-| `SDK_ANALYTICS` | Analytics Engine | read-path polls — dataset `switchbox_sdk_requests`, 3-month retention |
+| `SDK_ANALYTICS` | Analytics Engine | read-path polls — dataset `switchbox_sdk_requests`, 3-month retention; also the "Connected" badge source (ADR-059) |
 | `FLAG_ANALYTICS` | Analytics Engine | per-flag eval counts — dataset `switchbox_flag_evals` (MEASUREMENT Phase 1) |
-| `POSTHOG_HOST` | var | `https://eu.i.posthog.com` |
-| `POSTHOG_API_KEY` | secret | public project key; `sdk_first_fetch` is skipped when unset |
+| `BACKEND_URL` | var | `https://switchbox-backend.fly.dev` — first-telemetry activation ping |
+| `TELEMETRY_SEEN_SECRET` | secret | must match the backend's `TELEMETRY_INGEST_SECRET`; ping skipped when unset |

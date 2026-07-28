@@ -9,10 +9,9 @@ routes = [
 ]
 
 [vars]
-POSTHOG_HOST = "https://eu.i.posthog.com"
-# POSTHOG_API_KEY is set via `wrangler secret put POSTHOG_API_KEY`
-# (same public project key as the frontend's VITE_POSTHOG_KEY)
 # Backend origin for the first-telemetry activation ping (MEASUREMENT Phase 1).
+# The backend fires sdk_first_fetch — the sole activation source since the KV
+# retirement (ADR-059).
 BACKEND_URL = "https://switchbox-backend.fly.dev"
 # TELEMETRY_SEEN_SECRET is set via `wrangler secret put TELEMETRY_SEEN_SECRET`
 # (must match the backend's TELEMETRY_INGEST_SECRET Fly secret).
@@ -20,11 +19,6 @@ BACKEND_URL = "https://switchbox-backend.fly.dev"
 [[r2_buckets]]
 binding = "CONFIGS"
 bucket_name = "switchbox-configs"
-
-[[kv_namespaces]]
-binding = "CONNECTIONS"
-# Create with: npx wrangler kv namespace create CONNECTIONS
-id = "2afbbd888942493895222f6a082c60c4"
 
 [[analytics_engine_datasets]]
 binding = "SDK_ANALYTICS"

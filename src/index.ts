@@ -1,13 +1,12 @@
 interface Env {
   CONFIGS: R2Bucket;
-  CONNECTIONS: KVNamespace;
   SDK_ANALYTICS?: AnalyticsEngineDataset;
   // Anonymous per-flag evaluation counts (MEASUREMENT Phase 1 / ADR-055).
   FLAG_ANALYTICS?: AnalyticsEngineDataset;
-  POSTHOG_HOST: string;
-  POSTHOG_API_KEY?: string;
   // First-telemetry activation ping → the backend (MEASUREMENT Phase 1). Both
   // unset (local/CI) → the ping is skipped; the shared secret gates the endpoint.
+  // The backend fires sdk_first_fetch — the sole activation source since the KV
+  // retirement (ADR-059).
   BACKEND_URL?: string;
   TELEMETRY_SEEN_SECRET?: string;
 }
@@ -27,8 +26,8 @@ const TELEMETRY_MAX_VALUES_PER_FLAG = 20;
 const TELEMETRY_MAX_BODY_BYTES = 64 * 1024;
 // Basic in-isolate anti-abuse rate limit, per sdk_key per fixed 60s window.
 // Generous (a legit fleet sharing one key in one colo stays well under it); a
-// runaway sender is capped. Per-isolate/best-effort, like the conn-write memo —
-// an over-limit key just gets its telemetry sampled, which is acceptable.
+// runaway sender is capped. Per-isolate/best-effort — an over-limit key just
+// gets its telemetry sampled, which is acceptable.
 const TELEMETRY_RATE_WINDOW_MS = 60 * 1000;
 const TELEMETRY_RATE_MAX = 600;
 const telemetryRate = new Map<string, { windowStart: number; count: number }>();
@@ -50,26 +49,8 @@ const FIRST_SEEN_MEMO_MAX = 10_000;
 const configExistsMemo = new Set<string>();
 const CONFIG_EXISTS_MEMO_MAX = 10_000;
 
-// KV free tier is 1,000 writes/day; a 5-min throttle keeps an always-on
-// instance at ~288 writes/day. The Phase 4 badge threshold accounts for this.
-const KV_WRITE_THROTTLE_MS = 5 * 60 * 1000;
-
-// In-isolate memo of the last KV write time per conn key (FABLE_IMPROVEMENTS
-// 4.3). Without it every poll did a KV *read*, and the free tier's ~100k
-// reads/day breaks at roughly 35 always-on clients — long before the
-// 1k-writes/day budget the throttle above protects. With the memo, a poll
-// inside the throttle window does zero KV ops. Isolate-local by design: an
-// eviction or a new colo just costs one extra read (whose result re-primes the
-// memo), so writes stay globally throttled and the badge freshness is
-// unchanged.
-const connWriteMemo = new Map<string, number>();
-// Backstop against unbounded growth (keys = active SDK keys per isolate —
-// small in practice; a hostile key-scan would 404 before reaching KV anyway).
-const CONN_MEMO_MAX = 10_000;
-
 /** Test-only: clear isolate-local state between test cases. */
 export function _resetForTests(): void {
-  connWriteMemo.clear();
   telemetryRate.clear();
   firstSeenMemo.clear();
   configExistsMemo.clear();
@@ -153,7 +134,6 @@ export default {
     }
 
     recordRequest(env, request, sdkKey, "200", configVersion, object.size);
-    ctx.waitUntil(trackConnection(env, request, sdkKey));
 
     return new Response(body, {
       status: 200,
@@ -335,74 +315,3 @@ function recordRequest(
   }
 }
 
-// KV liveness upsert + first-ever-fetch detection. The KV key's absence is
-// the dedup for the activation event — no extra state needed.
-async function trackConnection(env: Env, request: Request, sdkKey: string): Promise<void> {
-  try {
-    const key = `conn:${sdkKey}`;
-    const now = new Date();
-    const nowMs = now.getTime();
-
-    // Hot path: a recent write is memoized in-isolate → zero KV ops (4.3).
-    const memo = connWriteMemo.get(key);
-    if (memo !== undefined && nowMs - memo < KV_WRITE_THROTTLE_MS) {
-      return;
-    }
-    if (connWriteMemo.size > CONN_MEMO_MAX) connWriteMemo.clear();
-
-    const lastSeen = await env.CONNECTIONS.get(key);
-
-    if (lastSeen === null) {
-      // First fetch ever for this key → activation signal. KV put FIRST, then
-      // the PostHog capture (FABLE_IMPROVEMENTS 4.4): the key's absence is the
-      // dedup, so a capture-before-put that failed the put would re-fire
-      // sdk_first_fetch on every poll. A lost capture after a successful put
-      // is the cheaper error. (Cross-colo KV consistency can still double-fire
-      // for multi-region fleets — known analytics noise, read the funnel
-      // accordingly.) A rotated key re-fires this; harmless — both keys alias
-      // to the same PostHog person.
-      await env.CONNECTIONS.put(key, now.toISOString());
-      connWriteMemo.set(key, nowMs);
-      await captureFirstFetch(env, request, sdkKey, now);
-      return;
-    }
-
-    const lastSeenMs = Date.parse(lastSeen);
-    if (Number.isNaN(lastSeenMs) || nowMs - lastSeenMs >= KV_WRITE_THROTTLE_MS) {
-      await env.CONNECTIONS.put(key, now.toISOString());
-      connWriteMemo.set(key, nowMs);
-    } else {
-      // Another colo/isolate wrote recently — memoize *its* timestamp so the
-      // next polls here skip the read too.
-      connWriteMemo.set(key, lastSeenMs);
-    }
-  } catch {
-    // Telemetry must never break the read path.
-  }
-}
-
-// Server-side PostHog capture. distinct_id = sdk_key is merged into the
-// owning user by the dashboard's posthog.alias(sdkKey) call on key copy.
-async function captureFirstFetch(env: Env, request: Request, sdkKey: string, now: Date): Promise<void> {
-  if (!env.POSTHOG_API_KEY) return;
-  try {
-    await fetch(`${env.POSTHOG_HOST}/i/v0/e/`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        api_key: env.POSTHOG_API_KEY,
-        event: "sdk_first_fetch",
-        distinct_id: sdkKey,
-        timestamp: now.toISOString(),
-        properties: {
-          sdk_key: sdkKey,
-          colo: request.cf?.colo ?? null,
-          country: request.cf?.country ?? null,
-          user_agent: request.headers.get("User-Agent") ?? null,
-        },
-      }),
-    });
-  } catch {
-    // Lost capture is acceptable; the caller's KV write still records liveness.
-  }
-}
