@@ -63,7 +63,9 @@ for emergencies/rollback (ADR-060).
 The `routes` block in `wrangler.toml` puts this Worker in front of
 `cdn.switchbox.dev/*` (it takes precedence over the R2 custom domain, which
 stays attached to the bucket). **Rollback:** comment out the `routes` block and
-redeploy — the R2 custom domain takes back over.
+redeploy — the R2 custom domain takes back over. Commit the commented-out
+`wrangler.toml` if the rollback must outlive the next push: CI auto-deploys
+whatever is on `main` (ADR-060).
 
 `sdk_first_fetch` is wired as step 5 of the **Activation** funnel in PostHog
 (see `OBSERVABILITY.md` Phase 3); since ADR-059 the backend fires it (first
