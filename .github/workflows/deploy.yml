@@ -1,0 +1,66 @@
+# Test → deploy → smoke pipeline (ADR-060; replaces the guard-only test.yml).
+# Tests still gate every push and PR; a push to main that passes them deploys
+# the worker with the repo-pinned wrangler, then smokes the live route — the
+# same shape as the backend's deploy. Local `npx wrangler deploy` still works
+# for emergencies/rollback (e.g. commenting out the route).
+name: Deploy
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: [main]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm run lint
+      - run: npm test
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # Serialize deploys; never cancel one mid-flight (this is the read path).
+    concurrency:
+      group: deploy-cdn-worker
+      cancel-in-progress: false
+    env:
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+      CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npx wrangler deploy
+
+      - name: Smoke — the worker (not the R2 fallback) answers the route
+        run: |
+          # An unknown-but-valid-format key must return the worker's JSON 404
+          # with CORS. The bare R2 custom domain (route removed/misdeployed)
+          # returns neither, so this proves the worker is serving.
+          status=$(curl -sS -o body.json -D headers.txt -w "%{http_code}" \
+            "https://cdn.switchbox.dev/smoke-unknown-key-0000000000000000/flags.json")
+          test "$status" = "404"
+          grep -qi "^access-control-allow-origin: \*" headers.txt
+          grep -q '"unknown_sdk_key"' body.json
+
+      - name: Smoke — a real config is served from R2
+        env:
+          SMOKE_SDK_KEY: ${{ secrets.SMOKE_SDK_KEY }}
+        run: |
+          # Fails when the secret is unset (same posture as the backend's
+          # SMOKE_CDN_URL) — a deploy that can't prove delivery didn't succeed.
+          # Point it at the "Monitoring - Don't Delete" project's env key.
+          test -n "$SMOKE_SDK_KEY" || { echo "SMOKE_SDK_KEY repo secret is unset"; exit 1; }
+          curl -sSf "https://cdn.switchbox.dev/${SMOKE_SDK_KEY}/flags.json" | grep -q '"flags"'

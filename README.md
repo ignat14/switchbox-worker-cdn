@@ -48,6 +48,16 @@ Expect 200, `Cache-Control: public, max-age=10` (matched to the 10s SDK poll —
 MEASUREMENT Phase 0), `Access-Control-Allow-Origin: *`; an unknown key returns a
 404 JSON body.
 
+## Deploy (CI)
+
+Pushes to `main` that pass lint + tests **deploy automatically via GitHub Actions**
+(`.github/workflows/deploy.yml`), then smoke the live route: the worker's JSON 404
+shape (proves the worker, not the R2 fallback, answers) and a real config via the
+`SMOKE_SDK_KEY` repo secret (the monitoring env's key). Repo secrets:
+`CLOUDFLARE_API_TOKEN` (Workers Scripts Edit + Workers Routes Edit on the zone),
+`CLOUDFLARE_ACCOUNT_ID`, `SMOKE_SDK_KEY`. Local `npx wrangler deploy` still works
+for emergencies/rollback (ADR-060).
+
 ## Cutover (done 2026-06-12) / rollback
 
 The `routes` block in `wrangler.toml` puts this Worker in front of
