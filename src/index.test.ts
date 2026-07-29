@@ -8,6 +8,17 @@ const KEY = "abcdefghijklmnopqrstuvwxyz0123456789ABCDEF-_";
 // not leak across tests.
 beforeEach(() => _resetForTests());
 
+const ETAG = '"d41d8cd98f00b204e9800998ecf8427e"';
+
+/** What the backend publisher stamps as the object's config-version metadata. */
+function versionOf(body: string): string {
+  try {
+    return String(JSON.parse(body).version ?? "");
+  } catch {
+    return "";
+  }
+}
+
 interface MockOpts {
   /** R2 .get behavior: an object body, null (missing), or "throw". */
   r2?: { body: string; size?: number } | null | "throw";
@@ -15,10 +26,18 @@ interface MockOpts {
   bodyThrows?: boolean;
   /** Make Analytics Engine writeDataPoint throw. */
   aeThrows?: boolean;
+  /** Omit the publisher's config-version metadata (an object published by an
+   * older backend — the worker then falls back to reading the body). */
+  noVersionMetadata?: boolean;
 }
 
 function makeEnv(opts: MockOpts) {
-  const { r2 = { body: '{"version":"v1","flags":{}}' }, bodyThrows, aeThrows } = opts;
+  const {
+    r2 = { body: '{"version":"v1","flags":{}}' },
+    bodyThrows,
+    aeThrows,
+    noVersionMetadata,
+  } = opts;
   return {
     CONFIGS: {
       get: vi.fn(async () => {
@@ -30,6 +49,8 @@ function makeEnv(opts: MockOpts) {
             return r2.body;
           },
           size: r2.size ?? r2.body.length,
+          httpEtag: ETAG,
+          customMetadata: noVersionMetadata ? {} : { "config-version": versionOf(r2.body) },
         };
       }),
       // Telemetry ingest gates on key existence via .head (MEASUREMENT Phase 1).
@@ -74,8 +95,18 @@ function makeCtx() {
 }
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
-function call(env: any, ctx: any, path = `/${KEY}/flags.json`, method = "GET") {
-  return worker.fetch(new Request(`https://cdn.switchbox.dev${path}`, { method }), env, ctx);
+function call(
+  env: any,
+  ctx: any,
+  path = `/${KEY}/flags.json`,
+  method = "GET",
+  headers: Record<string, string> = {},
+) {
+  return worker.fetch(
+    new Request(`https://cdn.switchbox.dev${path}`, { method, headers }),
+    env,
+    ctx,
+  );
 }
 
 describe("CDN worker — routing", () => {
@@ -115,6 +146,65 @@ describe("CDN worker — serving", () => {
     expect(res.headers.get("Cache-Control")).toBe("public, max-age=10");
     expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
     expect(res.headers.get("Content-Type")).toBe("application/json");
+  });
+});
+
+describe("CDN worker — conditional fetch (REF-8)", () => {
+  it("200 carries the object's ETag, and exposes it for cross-origin reads", async () => {
+    const { ctx } = makeCtx();
+    const res = await call(makeEnv({}), ctx);
+    expect(res.headers.get("ETag")).toBe(ETAG);
+    expect(res.headers.get("Access-Control-Expose-Headers")).toBe("ETag");
+  });
+
+  it("304 with no body when If-None-Match matches (same CORS + cache headers)", async () => {
+    const env = makeEnv({});
+    const { ctx } = makeCtx();
+    const res = await call(env, ctx, `/${KEY}/flags.json`, "GET", { "If-None-Match": ETAG });
+    expect(res.status).toBe(304);
+    expect(await res.text()).toBe("");
+    expect(res.headers.get("ETag")).toBe(ETAG);
+    expect(res.headers.get("Cache-Control")).toBe("public, max-age=10");
+    expect(res.headers.get("Access-Control-Allow-Origin")).toBe("*");
+    // No body read at all — the whole point of the 304.
+    expect(env.CONFIGS.get).toHaveBeenCalledOnce();
+  });
+
+  it("matches a weak validator (Cloudflare weakens ETags on compressed responses)", async () => {
+    const { ctx } = makeCtx();
+    const res = await call(makeEnv({}), ctx, `/${KEY}/flags.json`, "GET", {
+      "If-None-Match": `W/${ETAG}`,
+    });
+    expect(res.status).toBe(304);
+  });
+
+  it("serves the full body when If-None-Match is stale", async () => {
+    const { ctx } = makeCtx();
+    const res = await call(makeEnv({}), ctx, `/${KEY}/flags.json`, "GET", {
+      "If-None-Match": '"stale"',
+    });
+    expect(res.status).toBe(200);
+    expect(await res.text()).toBe('{"version":"v1","flags":{}}');
+  });
+
+  it("still records a telemetry row on a 304 — a 304 is a poll (instance counting)", async () => {
+    const env = makeEnv({ r2: { body: '{"version":"v7","flags":{}}' } });
+    const { ctx } = makeCtx();
+    await call(env, ctx, `/${KEY}/flags.json`, "GET", { "If-None-Match": ETAG });
+    expect(env.SDK_ANALYTICS.writeDataPoint).toHaveBeenCalledOnce();
+    const row = env.SDK_ANALYTICS.writeDataPoint.mock.calls[0][0];
+    expect(row.blobs[0]).toBe("304");
+    // The config version comes from R2 metadata, so the propagation panel keeps
+    // working without the body.
+    expect(row.blobs[4]).toBe("v7");
+  });
+
+  it("falls back to the body for the version when an object predates the metadata", async () => {
+    const env = makeEnv({ r2: { body: '{"version":"v7","flags":{}}' }, noVersionMetadata: true });
+    const { ctx } = makeCtx();
+    const res = await call(env, ctx, `/${KEY}/flags.json`, "GET", { "If-None-Match": ETAG });
+    expect(res.status).toBe(304);
+    expect(env.SDK_ANALYTICS.writeDataPoint.mock.calls[0][0].blobs[4]).toBe("v7");
   });
 });
 

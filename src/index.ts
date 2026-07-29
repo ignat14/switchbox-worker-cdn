@@ -63,7 +63,23 @@ const CORS_HEADERS: Record<string, string> = {
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "*",
   "Access-Control-Max-Age": "86400",
+  // Without this the browser SDK can't read the ETag off a cross-origin
+  // response, so it could never send If-None-Match back (REF-8).
+  "Access-Control-Expose-Headers": "ETag",
 };
+
+// Browser-side caching only — no edge cache in front of the Worker, so every
+// poll is observed. Matched to the 10s SDK poll (MEASUREMENT Phase 0): a longer
+// max-age would let the browser HTTP cache serve a stale config (and skip the
+// Worker → poll unobserved) for up to that window, defeating the faster
+// propagation and the read-path telemetry. (A conditional request carries its
+// own bypass: per the Fetch spec an If-None-Match header forces cache mode
+// "no-store", so an SDK poll always reaches us — see REF-8.)
+const CACHE_CONTROL = "public, max-age=10";
+
+// The config version rides along as R2 custom metadata (stamped by the backend
+// publisher) so a 304 can record it for telemetry without reading the body.
+const VERSION_METADATA_KEY = "config-version";
 
 function jsonResponse(status: number, body: unknown, extraHeaders: Record<string, string> = {}): Response {
   return new Response(JSON.stringify(body), {
@@ -115,6 +131,21 @@ export default {
       return jsonResponse(404, { error: "unknown_sdk_key" });
     }
 
+    // Conditional fetch (REF-8): the client already holds this exact config, so
+    // it costs an empty 304 instead of the full body. That's what raises the
+    // practical config-size ceiling — the payload is paid on the *first* fetch,
+    // not on every 10s poll of every SDK instance. A 304 is still a poll, so it
+    // gets its telemetry row (status "304") — instance counting and the
+    // propagation panel must not undercount.
+    const ifNoneMatch = request.headers.get("If-None-Match");
+    if (ifNoneMatch && etagMatches(ifNoneMatch, object.httpEtag)) {
+      recordRequest(env, request, sdkKey, "304", await versionFor(object), 0);
+      return new Response(null, {
+        status: 304,
+        headers: { ETag: object.httpEtag, "Cache-Control": CACHE_CONTROL, ...CORS_HEADERS },
+      });
+    }
+
     // The body stream can fail mid-read (truncated R2 response) — that's still
     // an R2 failure, so it takes the same controlled path as a failed .get:
     // JSON body + CORS headers + a telemetry row, never an uncontrolled 1101
@@ -126,12 +157,8 @@ export default {
       recordRequest(env, request, sdkKey, "500", "", 0);
       return jsonResponse(500, { error: "config_unavailable" });
     }
-    let configVersion = "";
-    try {
-      configVersion = String(JSON.parse(body).version ?? "");
-    } catch {
-      // Unparseable config still gets served; version just goes unrecorded.
-    }
+    // Unparseable config still gets served; version just goes unrecorded.
+    const configVersion = object.customMetadata?.[VERSION_METADATA_KEY] ?? parseVersion(body);
 
     recordRequest(env, request, sdkKey, "200", configVersion, object.size);
 
@@ -139,17 +166,51 @@ export default {
       status: 200,
       headers: {
         "Content-Type": "application/json",
-        // Browser-side caching only — no edge cache in front of the Worker, so
-        // every poll is observed. Matched to the 10s SDK poll (MEASUREMENT
-        // Phase 0): a longer max-age would let the browser HTTP cache serve a
-        // stale config (and skip the Worker → poll unobserved) for up to that
-        // window, defeating the faster propagation and the read-path telemetry.
-        "Cache-Control": "public, max-age=10",
+        // The client stores this and sends it back as If-None-Match (REF-8).
+        ETag: object.httpEtag,
+        "Cache-Control": CACHE_CONTROL,
         ...CORS_HEADERS,
       },
     });
   },
 };
+
+/** Does an If-None-Match header match this object's ETag? Accepts the
+ * comma-separated list form and weak validators — Cloudflare weakens a strong
+ * ETag to `W/"…"` when it compresses a response, so the tag a client echoes
+ * back is not always byte-identical to R2's. */
+function etagMatches(ifNoneMatch: string, etag: string): boolean {
+  if (ifNoneMatch.trim() === "*") return true;
+  const target = normalizeEtag(etag);
+  return ifNoneMatch.split(",").some((candidate) => normalizeEtag(candidate) === target);
+}
+
+function normalizeEtag(etag: string): string {
+  return etag.trim().replace(/^W\//, "");
+}
+
+function parseVersion(body: string): string {
+  try {
+    return String(JSON.parse(body).version ?? "");
+  } catch {
+    return "";
+  }
+}
+
+/** The config version for a 304's telemetry row, without shipping a body.
+ * Reads the R2 custom metadata the publisher stamps on; objects published
+ * before that (an older backend) fall back to reading the body just for the
+ * version, so the propagation panel stays honest through the transition — a
+ * fallback that disappears on the environment's next publish. */
+async function versionFor(object: R2ObjectBody): Promise<string> {
+  const stamped = object.customMetadata?.[VERSION_METADATA_KEY];
+  if (stamped !== undefined) return stamped;
+  try {
+    return parseVersion(await object.text());
+  } catch {
+    return "";
+  }
+}
 
 function truncate(value: string, max: number): string {
   return value.length > max ? value.slice(0, max) : value;

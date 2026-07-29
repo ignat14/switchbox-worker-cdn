@@ -45,8 +45,13 @@ curl -i https://switchbox-worker-cdn.<account>.workers.dev/<sdk_key>/flags.json
 ```
 
 Expect 200, `Cache-Control: public, max-age=10` (matched to the 10s SDK poll —
-MEASUREMENT Phase 0), `Access-Control-Allow-Origin: *`; an unknown key returns a
-404 JSON body.
+MEASUREMENT Phase 0), `Access-Control-Allow-Origin: *`, and an `ETag`; an unknown
+key returns a 404 JSON body. Echo the ETag back to check conditional fetch
+(REF-8) — expect an empty `304`:
+
+```bash
+curl -i -H 'If-None-Match: "<etag>"' https://switchbox-worker-cdn.<account>.workers.dev/<sdk_key>/flags.json
+```
 
 ## Deploy (CI)
 
