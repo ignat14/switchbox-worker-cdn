@@ -7,7 +7,7 @@ This repository contains the Cloudflare Worker for the Switchbox CDN. Keep chang
 Use Node.js 22, matching CI.
 
 - Install exactly from the lockfile: `npm ci`
-- Type-check/lint: `npm run lint`
+- Type-check: `npm run lint` (despite the script name, it currently runs `tsc --noEmit`; no separate linter is configured)
 - Run the test suite once: `npm test`
 - Build without deploying: `npx wrangler deploy --dry-run`
 - Start local development: `npm run dev`
